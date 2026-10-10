@@ -239,11 +239,14 @@ const FortuneRandom = (() => {
     const topicBonus=stars>=5 ? .6 : stars>=4 ? .3 : 0;
     return 1 + topicBonus + fortune.directions.reduce((sum,d) => sum + (directions[d] || 0)*.5,0);
   }
-  function draw(topic,directions){
+  let pending=null;
+  function draw(topic,directions,rejectedSlipId=null){
     const ids=seen();
-    let pool=fortunes.filter(f => !ids.includes(f.id));
+    let pool=fortunes.filter(f => !ids.includes(f.id)&&f.id!==rejectedSlipId);
     const exhausted=pool.length===0;
-    if(exhausted) pool=fortunes;
+    // A spent candidate cycle can restart, but never reuse this round's
+    // rejected slip. Persist that rollover only when a poem is revealed.
+    if(exhausted) pool=fortunes.filter(f=>f.id!==rejectedSlipId);
     const weights=pool.map(f => weight(f,topic,directions));
     const total=weights.reduce((a,b)=>a+b,0);
     let threshold=unit()*total;
@@ -251,11 +254,16 @@ const FortuneRandom = (() => {
     for(let i=0;i<pool.length;i++){
       threshold-=weights[i];if(threshold<0){selected=pool[i];break;}
     }
-    memory=[...(exhausted?[]:ids),selected.id];
-    try{localStorage.setItem(key,JSON.stringify(memory));}catch{}
+    pending={id:selected.id,exhausted};
     return selected;
   }
-  return {unit,seen,weight,draw};
+  function commit(fortune){
+    if(!pending||pending.id!==fortune.id)return;
+    memory=[...new Set([...(pending.exhausted?[]:seen()),fortune.id])];
+    pending=null;
+    try{localStorage.setItem(key,JSON.stringify(memory));}catch{}
+  }
+  return {unit,seen,weight,draw,commit};
 })();
 
 'use strict';
@@ -285,21 +293,26 @@ const FortuneKingTest = (() => {
       return Array.isArray(parsed) ? [...new Set(parsed)].filter(id => kings.some(f => f.id === id)) : memory;
     } catch { return memory; }
   }
-  function draw() {
+  let pending=null;
+  function draw(rejectedSlipId=null) {
     if (!enabled || !kings.length) throw new Error('籤王測試模式未啟用');
     const testIds = seen();
     let productionIds = [];
     try { productionIds = FortuneRandom.seen(); } catch {}
     // Prefer kings unseen both in ordinary play and previous test draws.
-    let pool = kings.filter(f => !productionIds.includes(f.id) && !testIds.includes(f.id));
-    if (!pool.length) pool = kings.filter(f => !testIds.includes(f.id));
-    if (!pool.length) pool = kings;
+    let pool = kings.filter(f => f.id!==rejectedSlipId && !productionIds.includes(f.id) && !testIds.includes(f.id));
+    if (!pool.length) pool = kings.filter(f => f.id!==rejectedSlipId && !testIds.includes(f.id));
+    if (!pool.length) pool = kings.filter(f=>f.id!==rejectedSlipId);
     const selected = pool[Math.min(pool.length - 1, Math.floor(FortuneRandom.unit() * pool.length))];
-    memory = [...new Set([...testIds, selected.id])];
-    try { localStorage.setItem(key, JSON.stringify(memory)); } catch {}
+    pending=selected.id;
     return selected;
   }
-  return { enabled, draw };
+  function commit(fortune){
+    if(!enabled||pending!==fortune.id)return;
+    memory=[...new Set([...seen(),fortune.id])];pending=null;
+    try{localStorage.setItem(key,JSON.stringify(memory));}catch{}
+  }
+  return { enabled, draw, commit };
 })();
 
 'use strict';
@@ -366,7 +379,7 @@ const FortuneAudio=(()=>{
  if(FortuneKingTest.enabled){const badge=document.createElement('small');badge.className='test-king-badge';badge.textContent='TEST｜KING';badge.setAttribute('aria-label','籤王測試模式');document.body.append(badge);}
  const hintWriters=new Map();
  let roundQuestions=[],questionOptions=[];
- let state='ENTRY',topic=null,index=0,directions={},selected=null,throws=0,typingTimer=null,typingFull='',lastTap=-Infinity,videoGeneration=0,flowGeneration=0,answerLocked=false,entered=false;
+ let state='ENTRY',topic=null,index=0,directions={},selected=null,throws=0,rejectedSlipId=null,typingTimer=null,typingFull='',lastTap=-Infinity,videoGeneration=0,flowGeneration=0,answerLocked=false,entered=false;
  const sleep=ms=>new Promise(r=>setTimeout(r,ms));
  // Render the supplied objects with an edge-connected, binary background mask.
  // Dark pixels inside the wood stay solid; no screen blending or translucent trails.
@@ -420,6 +433,7 @@ const FortuneAudio=(()=>{
  function markSession(){try{sessionStorage.setItem(sessionKey,'1');}catch{}}
  function showRoom({keepMusic=false}={}){
   ++flowGeneration;++videoGeneration;FortuneAudio.stopShake();$('movie').pause();$('movie').onended=null;
+  rejectedSlipId=null;selected=null;throws=0;
   $('tube').className='tube';$('blocks').className='blocks';$('blocks').disabled=true;$('blocks').hidden=true;scene('room','ROOM_TOPIC_SELECT');
   writeHint('room-eyebrow','一盞燈・一個念頭');writeHint('room-heading','今夜，想為哪一處留盞燈？');writeHint('room-note','輕觸木牌，讓思緒慢慢落定。');if(!keepMusic)FortuneAudio.room();
  }
@@ -454,7 +468,7 @@ const FortuneAudio=(()=>{
  });
  function chooseTopic(i){
   if(state!=='ROOM_TOPIC_SELECT'||!Number.isInteger(i)||i<0||i>=topics.length)return false;
-  topic=topics[i];roundQuestions=FortunePresentation.shuffle(topic.questions);index=0;directions={'放慢':0,'行動':0,'整理':0,'支持':0};selected=null;throws=0;showQuestion();return true;
+  topic=topics[i];roundQuestions=FortunePresentation.shuffle(topic.questions);index=0;directions={'放慢':0,'行動':0,'整理':0,'支持':0};selected=null;throws=0;rejectedSlipId=null;showQuestion();return true;
  }
  function completeTyping(){
   if(!typingTimer)return;clearInterval(typingTimer);typingTimer=null;$('question-text').textContent=typingFull;$('question-text').classList.remove('typing');
@@ -481,10 +495,10 @@ const FortuneAudio=(()=>{
   if(state!=='FORTUNE_SHAKE')return false;
   const gen=flowGeneration;state='STICK_RISE';$('stage').dataset.state=state;
   $('tube').className='tube risen';$('tube').disabled=true;FortuneAudio.stopShake();FortuneAudio.effect('stop');
-  selected=FortuneKingTest.enabled?FortuneKingTest.draw():FortuneRandom.draw(topic.name,directions);
+  selected=FortuneKingTest.enabled?FortuneKingTest.draw(rejectedSlipId):FortuneRandom.draw(topic.name,directions,rejectedSlipId);
   writeHint('ritual-text','一支籤，正慢慢靠近。');$('ritual-hint').textContent='';
   await sleep(2100);if(gen!==flowGeneration)return false;
-  state='JIAOBEI_1';$('stage').dataset.state=state;$('blocks').hidden=false;$('blocks').disabled=false;$('blocks').className='blocks ready';writeHint('ritual-text','輕碰筊杯，讓回應落定。');writeHint('ritual-hint','這是儀式的一部分，讓自己稍作停留。');return true;
+  state=throws===0?'JIAOBEI_1':'JIAOBEI_2';$('stage').dataset.state=state;$('blocks').hidden=false;$('blocks').disabled=false;$('blocks').className='blocks ready';writeHint('ritual-text','輕碰筊杯，讓回應落定。');writeHint('ritual-hint','這是儀式的一部分，讓自己稍作停留。');return true;
  }
  async function throwBlocks(){
   if(state!=='JIAOBEI_1'&&state!=='JIAOBEI_2')return false;
@@ -504,7 +518,14 @@ const FortuneAudio=(()=>{
   // Wait for the real last frame, not a timer that can run before paint.
   await landed;if(gen!==flowGeneration)return false;
   setBlockPose(result);$('blocks').className='blocks';
-  if(result!==1){state='JIAOBEI_2';$('stage').dataset.state=state;writeHint('ritual-text','回應尚未落定，再試一次。');writeHint('ritual-hint','再輕觸一次筊杯即可。');$('blocks').disabled=false;$('blocks').className='blocks ready';return true;}
+  if(result!==1){
+   rejectedSlipId=selected.id;selected=null;
+   state='FORTUNE_REDRAW_NOTICE';$('stage').dataset.state=state;
+   writeHint('ritual-text','回應尚未落定，再抽一支。');writeHint('ritual-hint','');
+   // Keep the landed faces locked during the notice. No cup-only retry.
+   await sleep(1800);if(gen!==flowGeneration)return false;
+   startShake();return true;
+  }
   writeHint('ritual-text','讓我們打開這份提醒。');await sleep(650);if(gen!==flowGeneration)return false;
   const patches=[];
   for(const y of [312,408,504,599])for(const x of [416,527,636,746])patches.push({x,y});
@@ -538,6 +559,8 @@ const FortuneAudio=(()=>{
   if(king){FortuneAudio.fade(.08,300);playVideo('assets/king.mp4','KING_EASTER_EGG',showReading,'籤王');}else showReading();
  }
  function showReading(){
+  // Only the poem actually opened for reading enters its own mode's history.
+  if(FortuneKingTest.enabled)FortuneKingTest.commit(selected);else FortuneRandom.commit(selected);
   state='READING';$('stage').dataset.state=state;FortuneAudio.fade(.36,1000);
   $('reading').classList.remove('closing');$('close-reading').disabled=false;
   $('paper').classList.toggle('king',selected.level==='籤王');$('fortune-id').textContent=`第 ${selected.id} 籤`;$('fortune-level').textContent=selected.level;
